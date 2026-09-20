@@ -109,7 +109,7 @@ public final class VoxCPM2TTS: @unchecked Sendable {
         self.vocoder = try await GraphModel(contentsOf: paths.vocoder, computeUnits: compute.vocoder)
         self.glue = try VoxCPM2Glue(directory: paths.glueDir)
         self.tokenizer = try await AutoTokenizer.from(modelFolder: paths.tokenizerDir)
-        self.cjkSplitMap = Self.buildCJKSplitMap(tokenizerDir: paths.tokenizerDir)
+        self.cjkSplitMap = CJKTokenSplit.buildMap(tokenizerDir: paths.tokenizerDir)
         self.prefillLen = paths.prefillLen
         if let pb = paths.prefillBase, let pr = paths.prefillRes,
            FileManager.default.fileExists(atPath: pb.path), FileManager.default.fileExists(atPath: pr.path) {
@@ -334,6 +334,7 @@ public final class VoxCPM2TTS: @unchecked Sendable {
     public func synthesizeSession(
         _ segments: [String], seed: UInt64 = 0,
         maxFramesPerSegment: Int = 300, minFrames: Int = 2,
+        resetPrefix: String? = nil,
         onChunk: @Sendable (Int, [Float]) async -> Void
     ) async throws -> StreamStats {
         let H = Self.hidden
@@ -386,18 +387,30 @@ public final class VoxCPM2TTS: @unchecked Sendable {
             currentSegment = segmentIndex
             var ids = tokenizer.encode(text: segment, addSpecialTokens: false)
             ids = ids.flatMap { cjkSplitMap[$0] ?? [$0] }
-            ids.append(Self.audioStart)
-            let T = ids.count
-            guard T > 0 else { continue }
 
             // The decode bundles are cl512: text + frames share the position
-            // space. Reset (fresh session) before overrunning it.
-            if pos + T + maxFramesPerSegment > Self.kvCapacity {
+            // space. Reset (fresh session) before overrunning it. The estimate
+            // includes headroom for the reset prefix (+audioStart) so the
+            // re-anchored segment still fits.
+            let prefixAllowance = (resetPrefix == nil ? 0 : 24) + 1
+            if pos + ids.count + prefixAllowance + maxFramesPerSegment > Self.kvCapacity {
                 baseDecode.resetState(); resDecode.resetState()
                 cond = [Float](repeating: 0, count: Self.feat * Self.patch)
                 pos = 0
                 sessionFresh = true
             }
+
+            // A fresh session (start of the run, or after a KV-budget reset)
+            // has no acoustic history: prepend the caller's anchor text (e.g. a
+            // Voice Design description) so the voice is re-anchored there.
+            // Mid-session segments rely on the KV history instead.
+            if sessionFresh, let resetPrefix {
+                ids = tokenizer.encode(text: resetPrefix + segment, addSpecialTokens: false)
+                ids = ids.flatMap { cjkSplitMap[$0] ?? [$0] }
+            }
+            ids.append(Self.audioStart)
+            let T = ids.count
+            guard T > 0 else { continue }
 
             // ---- prefill this segment's text ----
             let pf = Date()
@@ -432,20 +445,31 @@ public final class VoxCPM2TTS: @unchecked Sendable {
                 resDecode.adoptState(from: pRes)
             } else {
                 // Continuation prefill through the decode bundles so the KV
-                // history (and thus the voice) is preserved.
+                // history (and thus the voice) is preserved. Pipelined: res step
+                // t needs only baseHidden[t], so it runs CONCURRENTLY with base
+                // step t+1; res order is preserved by awaiting t before issuing
+                // t+1. Cuts the prefill wall roughly to the base LM's time alone.
                 var baseHidden: [[Float]] = []; baseHidden.reserveCapacity(T)
+                var resPending: Task<[String: TensorValue], Error>?
+                var resHidden: [Float] = zeros
                 for t in 0..<T {
                     let o = try await baseDecode.step([
                         "inputs_embeds": .float32(glue.embedRow(ids[t]), shape: [1, 1, H]),
                         "pos": .int32([Int32(pos + t)], shape: [1])])
                     baseHidden.append(try out(o, "hidden"))
+                    if let pendingRes = resPending {
+                        resHidden = try out(try await pendingRes.value, "hidden")
+                    }
+                    let resIn = glue.fusion(baseHidden[t], zeros)
+                    let resPos = Int32(pos + t)
+                    resPending = Task {
+                        try await resDecode.step([
+                            "inputs_embeds": .float32(resIn, shape: [1, 1, H]),
+                            "pos": .int32([resPos], shape: [1])])
+                    }
                 }
-                var resHidden: [Float] = []
-                for t in 0..<T {
-                    let o = try await resDecode.step([
-                        "inputs_embeds": .float32(glue.fusion(baseHidden[t], zeros), shape: [1, 1, H]),
-                        "pos": .int32([Int32(pos + t)], shape: [1])])
-                    resHidden = try out(o, "hidden")
+                if let pendingRes = resPending {
+                    resHidden = try out(try await pendingRes.value, "hidden")
                 }
                 lmH = baseHidden[T - 1]; resH = resHidden
             }
@@ -554,39 +578,6 @@ public final class VoxCPM2TTS: @unchecked Sendable {
         baseDecode.resetState(); resDecode.resetState()
     }
 
-    // MARK: - CJK token splitting
-
-    /// Builds the multi-char CJK token -> single-char ids map from tokenizer.json,
-    /// mirroring openbmb/VoxCPM2's tokenization_voxcpm2.py (VoxCPM2Tokenizer):
-    /// every vocab entry whose text (sans the U+2581 word marker) is >= 2 CJK
-    /// characters is expanded to the ids of its individual characters. Tokens
-    /// whose characters are not themselves in the vocab are left unsplit (the
-    /// official code makes the same check against the unk id).
-    private static func buildCJKSplitMap(tokenizerDir: URL) -> [Int: [Int]] {
-        guard let data = try? Data(contentsOf: tokenizerDir.appendingPathComponent("tokenizer.json")),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let model = root["model"] as? [String: Any],
-              let vocab = model["vocab"] as? [String: Int] else { return [:] }
-        var map: [Int: [Int]] = [:]
-        for (token, tid) in vocab {
-            let clean = token.replacingOccurrences(of: "\u{2581}", with: "")
-            guard clean.count >= 2, clean.allSatisfy(isCJK) else { continue }
-            let charIDs = clean.compactMap { vocab[String($0)] }
-            guard charIDs.count == clean.count else { continue }
-            map[tid] = charIDs
-        }
-        return map
-    }
-
-    /// CJK ranges per the official tokenizer: Unified + Ext-A + Compat + Ext-B.
-    private static func isCJK(_ c: Character) -> Bool {
-        c.unicodeScalars.count == 1 && c.unicodeScalars.allSatisfy { s in
-            (s.value >= 0x4E00 && s.value <= 0x9FFF)
-                || (s.value >= 0x3400 && s.value <= 0x4DBF)
-                || (s.value >= 0xF900 && s.value <= 0xFAFF)
-                || (s.value >= 0x20000 && s.value <= 0x2A6DF)
-        }
-    }
 }
 
 /// Deterministic standard-normal generator (SplitMix64 + Box–Muller) — VoxCPM2's only stochastic input.

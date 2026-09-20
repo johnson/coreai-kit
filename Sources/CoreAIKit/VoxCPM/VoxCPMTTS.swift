@@ -154,6 +154,8 @@ public final class VoxCPMTTS: @unchecked Sendable {
     private let vocoder: GraphModel
     private let glue: VoxCPMGlue
     private let tokenizer: any Tokenizer
+    /// Multi-char CJK token id -> single-char token ids (see buildCJKSplitMap).
+    private let cjkSplitMap: [Int: [Int]]
     // Optional q=T batched prefill bundles (one call replaces T sequential decodes). Loaded on GPU
     // (q=32 is compute-bound — GPU is fast and reliable for it). nil -> decode-loop prefill.
     private let prefillBase: StatefulGraphModel?
@@ -176,6 +178,7 @@ public final class VoxCPMTTS: @unchecked Sendable {
         self.vocoder = try await GraphModel(contentsOf: paths.vocoder, computeUnits: compute.vocoder)
         self.glue = try VoxCPMGlue(directory: paths.glueDir)
         self.tokenizer = try await AutoTokenizer.from(modelFolder: paths.tokenizerDir)
+        self.cjkSplitMap = CJKTokenSplit.buildMap(tokenizerDir: paths.tokenizerDir)
         self.prefillLen = paths.prefillLen
         if let pb = paths.prefillBase, let pr = paths.prefillRes,
            FileManager.default.fileExists(atPath: pb.path), FileManager.default.fileExists(atPath: pr.path) {
@@ -226,6 +229,10 @@ public final class VoxCPMTTS: @unchecked Sendable {
         profile = [:]
 
         var ids = tokenizer.encode(text: text, addSpecialTokens: false)
+        // VoxCPM (v1) was also trained with mask_multichar_chinese_tokens (see
+        // OpenBMB/VoxCPM src/voxcpm/model/voxcpm.py): expand multi-character
+        // Chinese tokens to single-character ids, same as VoxCPM2TTS.
+        ids = ids.flatMap { cjkSplitMap[$0] ?? [$0] }
         ids.append(Self.audioStart)
         let T = ids.count
 
