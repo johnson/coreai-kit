@@ -82,6 +82,7 @@ public final class VoxCPM2TTS: @unchecked Sendable {
     private static let patch = 4                  // latent columns per decode frame
     private static let vaeFrames = 8              // columns baked into the vocoder bundle
     private static let colSamples = 1920          // 48 kHz samples per latent column (1920x upsample)
+    private static let seamBlend = 960            // 20 ms crossfade across vocoder window seams
 
     private let baseDecode: StatefulGraphModel
     private let resDecode: StatefulGraphModel
@@ -218,6 +219,15 @@ public final class VoxCPM2TTS: @unchecked Sendable {
         var cond = [Float](repeating: 0, count: Self.feat * Self.patch)   // [1,64,4], layout [c*4+p]
         var pending: [[Float]] = []; pending.reserveCapacity(framesPerChunk)
 
+        // The vocoder decodes each 8-column window independently: its convolutions
+        // zero-pad past the window edges, so samples near a seam are computed
+        // without temporal context and the waveform jumps at every 0.32 s boundary —
+        // audible as clicks, worst in quiet passages. Hold back the last seamBlend
+        // samples of each window and crossfade them (raised cosine) with the next
+        // window's head instead of emitting them directly; the seam jump becomes a
+        // smooth transition. Costs no extra compute and 20 ms of latency.
+        var holdback: [Float] = []
+
         func flush() async throws {
             guard !pending.isEmpty else { return }
             let vt = Date()
@@ -226,7 +236,29 @@ public final class VoxCPM2TTS: @unchecked Sendable {
             pending.removeAll(keepingCapacity: true)
             if firstChunk < 0 { firstChunk = Date().timeIntervalSince(start) }
             totalSamples += wav.count
-            try await emit(wav)
+            var out: [Float] = []
+            let n = min(Self.seamBlend, holdback.count, wav.count)
+            if n > 0 {
+                out.reserveCapacity(holdback.count + wav.count - Self.seamBlend)
+                for i in 0..<n {
+                    let t = Float(i + 1) / Float(n + 1)
+                    let w = 0.5 - 0.5 * cos(Float.pi * t)
+                    out.append(holdback[i] * (1 - w) + wav[i] * w)
+                }
+                out.append(contentsOf: wav[n...])
+            } else {
+                out = holdback + wav
+            }
+            holdback = Array(out.suffix(Self.seamBlend))
+            try await emit(Array(out.dropLast(min(Self.seamBlend, out.count))))
+        }
+
+        /// Emits the final holdback after the last window of the run.
+        func flushTail() async throws {
+            guard !holdback.isEmpty else { return }
+            let tail = holdback
+            holdback = []
+            try await emit(tail)
         }
 
         for i in 0..<maxFrames {
@@ -271,6 +303,7 @@ public final class VoxCPM2TTS: @unchecked Sendable {
             tick("resDecode", rt)
         }
         try await flush()
+        try await flushTail()
 
         let total = Date().timeIntervalSince(start)
         return StreamStats(samples: totalSamples,
