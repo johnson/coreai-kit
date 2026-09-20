@@ -146,6 +146,8 @@ public final class VoxCPMTTS: @unchecked Sendable {
     private static let feat = 64
     private static let patch = 2                  // columns per decode frame
     private static let vaeFrames = 12            // columns baked into the vocoder bundle
+    private static let seamBlend = 320           // 20 ms crossfade across vocoder window seams
+    private static let kvCapacity = 500          // cl512 decode bundles, small safety margin
 
     private let baseDecode: StatefulGraphModel
     private let resDecode: StatefulGraphModel
@@ -258,20 +260,29 @@ public final class VoxCPMTTS: @unchecked Sendable {
             baseDecode.adoptState(from: pBase)                            // seed decode KV from prefill KV
             resDecode.adoptState(from: pRes)
         } else {
+            // Pipelined (see VoxCPM2TTS): res step t overlaps base step t+1.
+            // v1: res input is the base hidden DIRECTLY (no fusion layer).
             var baseHidden: [[Float]] = []
             baseHidden.reserveCapacity(T)
+            var resPending: Task<[String: TensorValue], Error>?
+            var resHidden: [Float] = [Float](repeating: 0, count: H)
             for t in 0..<T {
                 let o = try await baseDecode.step([
                     "inputs_embeds": .float32(glue.embedRow(ids[t]), shape: [1, 1, H]),
                     "pos": .int32([Int32(t)], shape: [1])])
                 baseHidden.append(try out(o, "hidden"))
+                if let pendingRes = resPending {
+                    resHidden = try out(try await pendingRes.value, "hidden")
+                }
+                let resIn = baseHidden[t]
+                resPending = Task {
+                    try await resDecode.step([
+                        "inputs_embeds": .float32(resIn, shape: [1, 1, H]),
+                        "pos": .int32([Int32(t)], shape: [1])])
+                }
             }
-            var resHidden: [Float] = []
-            for t in 0..<T {
-                let o = try await resDecode.step([
-                    "inputs_embeds": .float32(baseHidden[t], shape: [1, 1, H]),
-                    "pos": .int32([Int32(t)], shape: [1])])
-                resHidden = try out(o, "hidden")
+            if let pendingRes = resPending {
+                resHidden = try out(try await pendingRes.value, "hidden")
             }
             lmH = baseHidden[T - 1]
             resH = resHidden
@@ -284,6 +295,13 @@ public final class VoxCPMTTS: @unchecked Sendable {
         var pending: [[Float]] = []                                       // frames awaiting a vocoder window
         pending.reserveCapacity(framesPerChunk)
 
+        // Same seam treatment as VoxCPM2TTS: each 12-column window is vocoded
+        // independently (zero-padded conv edges), so the waveform jumps at
+        // every 0.48 s boundary — audible as clicks in quiet passages. Hold
+        // back the last seamBlend samples and raised-cosine crossfade them
+        // with the next window's head. No extra compute, 20 ms of latency.
+        var holdback: [Float] = []
+
         func flush() async throws {
             guard !pending.isEmpty else { return }
             let vt = Date()
@@ -292,7 +310,28 @@ public final class VoxCPMTTS: @unchecked Sendable {
             pending.removeAll(keepingCapacity: true)
             if firstChunk < 0 { firstChunk = Date().timeIntervalSince(start) }
             totalSamples += wav.count
-            try await emit(wav)
+            var out: [Float] = []
+            let n = min(Self.seamBlend, holdback.count, wav.count)
+            if n > 0 {
+                for i in 0..<n {
+                    let t = Float(i + 1) / Float(n + 1)
+                    let w = 0.5 - 0.5 * cos(Float.pi * t)
+                    out.append(holdback[i] * (1 - w) + wav[i] * w)
+                }
+                out.append(contentsOf: wav[n...])
+            } else {
+                out = holdback + wav
+            }
+            holdback = Array(out.suffix(Self.seamBlend))
+            try await emit(Array(out.dropLast(min(Self.seamBlend, out.count))))
+        }
+
+        /// Emits the final holdback after the last window of the run.
+        func flushTail() async throws {
+            guard !holdback.isEmpty else { return }
+            let tail = holdback
+            holdback = []
+            try await emit(tail)
         }
 
         for i in 0..<maxFrames {
@@ -338,6 +377,7 @@ public final class VoxCPMTTS: @unchecked Sendable {
             tick("resDecode", rt)
         }
         try await flush()                                                // final partial window (< 6 frames)
+        try await flushTail()
 
         let total = Date().timeIntervalSince(start)
         return StreamStats(samples: totalSamples,
@@ -346,6 +386,7 @@ public final class VoxCPMTTS: @unchecked Sendable {
     }
 
     // MARK: - vocoder
+
 
     /// Decode one vocoder window (≤ `vaeFrames` columns) of `frames` -> 16 kHz wav. Independent per
     /// window (the bundle bakes the 12-column width and is stateless), so windowing here is identical

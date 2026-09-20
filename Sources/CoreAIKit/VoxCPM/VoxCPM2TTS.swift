@@ -197,19 +197,30 @@ public final class VoxCPM2TTS: @unchecked Sendable {
             baseDecode.adoptState(from: pBase)
             resDecode.adoptState(from: pRes)
         } else {
+            // Pipelined: res step t needs only baseHidden[t], so it runs
+            // CONCURRENTLY with base step t+1 (res order preserved by awaiting
+            // t before issuing t+1). Cuts slow-path prefill wall roughly to the
+            // base LM's time alone — matters for long texts (T > prefillLen).
             var baseHidden: [[Float]] = []; baseHidden.reserveCapacity(T)
+            var resPending: Task<[String: TensorValue], Error>?
+            var resHidden: [Float] = zeros
             for t in 0..<T {
                 let o = try await baseDecode.step([
                     "inputs_embeds": .float32(glue.embedRow(ids[t]), shape: [1, 1, H]),
                     "pos": .int32([Int32(t)], shape: [1])])
                 baseHidden.append(try out(o, "hidden"))
+                if let pendingRes = resPending {
+                    resHidden = try out(try await pendingRes.value, "hidden")
+                }
+                let resIn = glue.fusion(baseHidden[t], zeros)
+                resPending = Task {
+                    try await resDecode.step([
+                        "inputs_embeds": .float32(resIn, shape: [1, 1, H]),
+                        "pos": .int32([Int32(t)], shape: [1])])
+                }
             }
-            var resHidden: [Float] = []
-            for t in 0..<T {
-                let o = try await resDecode.step([
-                    "inputs_embeds": .float32(glue.fusion(baseHidden[t], zeros), shape: [1, 1, H]),
-                    "pos": .int32([Int32(t)], shape: [1])])
-                resHidden = try out(o, "hidden")
+            if let pendingRes = resPending {
+                resHidden = try out(try await pendingRes.value, "hidden")
             }
             lmH = baseHidden[T - 1]; resH = resHidden
         }
@@ -305,225 +316,6 @@ public final class VoxCPM2TTS: @unchecked Sendable {
         }
         try await flush()
         try await flushTail()
-
-        let total = Date().timeIntervalSince(start)
-        return StreamStats(samples: totalSamples,
-                           firstChunkSeconds: firstChunk < 0 ? total : firstChunk,
-                           totalSeconds: total, sampleRate: Self.sampleRate)
-    }
-
-    // MARK: - Multi-segment sessions
-
-    /// Synthesizes several text segments in ONE continuous session: the LM KV
-    /// state and the acoustic feedback (cond) are NOT reset between segments,
-    /// so the voice stays consistent across sentence boundaries. (Independent
-    /// synthesize() calls re-imagine the voice from text alone every time —
-    /// promptless generation drifts per segment, which is audible as a voice
-    /// change on every sentence of a long article.)
-    ///
-    /// The decode bundles are cl512: when the session's position budget
-    /// (text tokens + audio frames) runs out, state resets and a fresh session
-    /// begins — voice may shift at that point (~80 s of audio in), not per
-    /// sentence. Between segments the stop head is treated as "segment done",
-    /// not "end of speech".
-    ///
-    /// Trade-off vs synthesize(): continuation segments prefill token-by-token
-    /// through the decode bundles (the t32 prefill bundles would REPLACE the
-    /// KV state via adoptState), costing ~T extra LM steps per segment.
-    @discardableResult
-    public func synthesizeSession(
-        _ segments: [String], seed: UInt64 = 0,
-        maxFramesPerSegment: Int = 300, minFrames: Int = 2,
-        resetPrefix: String? = nil,
-        onChunk: @Sendable (Int, [Float]) async -> Void
-    ) async throws -> StreamStats {
-        let H = Self.hidden
-        let framesPerChunk = Self.vaeFrames / Self.patch
-        let start = Date()
-        var firstChunk = -1.0
-        var totalSamples = 0
-        profile = [:]
-        let zeros = [Float](repeating: 0, count: H)
-
-        var rng = GaussianRNG(seed: seed)
-        var cond = [Float](repeating: 0, count: Self.feat * Self.patch)
-        var pending: [[Float]] = []; pending.reserveCapacity(framesPerChunk)
-        var holdback: [Float] = []
-        var currentSegment = 0
-
-        func flush() async throws {
-            guard !pending.isEmpty else { return }
-            let vt = Date()
-            let wav = try await vocodeChunk(pending)
-            tick("vocoder", vt)
-            pending.removeAll(keepingCapacity: true)
-            if firstChunk < 0 { firstChunk = Date().timeIntervalSince(start) }
-            totalSamples += wav.count
-            var out: [Float] = []
-            let n = min(Self.seamBlend, holdback.count, wav.count)
-            if n > 0 {
-                for i in 0..<n {
-                    let t = Float(i + 1) / Float(n + 1)
-                    let w = 0.5 - 0.5 * cos(Float.pi * t)
-                    out.append(holdback[i] * (1 - w) + wav[i] * w)
-                }
-                out.append(contentsOf: wav[n...])
-            } else {
-                out = holdback + wav
-            }
-            holdback = Array(out.suffix(Self.seamBlend))
-            try await onChunk(currentSegment, Array(out.dropLast(min(Self.seamBlend, out.count))))
-        }
-
-        var lmH = zeros
-        var resH = zeros
-        var pos = 0
-        var sessionFresh = true
-
-        for (segmentIndex, segment) in segments.enumerated() {
-            // Cooperative cancellation: the whole session would otherwise keep
-            // generating (and burning GPU) long after the caller stopped caring.
-            if Task.isCancelled { break }
-            currentSegment = segmentIndex
-            var ids = tokenizer.encode(text: segment, addSpecialTokens: false)
-            ids = ids.flatMap { cjkSplitMap[$0] ?? [$0] }
-
-            // The decode bundles are cl512: text + frames share the position
-            // space. Reset (fresh session) before overrunning it. The estimate
-            // includes headroom for the reset prefix (+audioStart) so the
-            // re-anchored segment still fits.
-            let prefixAllowance = (resetPrefix == nil ? 0 : 24) + 1
-            if pos + ids.count + prefixAllowance + maxFramesPerSegment > Self.kvCapacity {
-                baseDecode.resetState(); resDecode.resetState()
-                cond = [Float](repeating: 0, count: Self.feat * Self.patch)
-                pos = 0
-                sessionFresh = true
-            }
-
-            // A fresh session (start of the run, or after a KV-budget reset)
-            // has no acoustic history: prepend the caller's anchor text (e.g. a
-            // Voice Design description) so the voice is re-anchored there.
-            // Mid-session segments rely on the KV history instead.
-            if sessionFresh, let resetPrefix {
-                ids = tokenizer.encode(text: resetPrefix + segment, addSpecialTokens: false)
-                ids = ids.flatMap { cjkSplitMap[$0] ?? [$0] }
-            }
-            ids.append(Self.audioStart)
-            let T = ids.count
-            guard T > 0 else { continue }
-
-            // ---- prefill this segment's text ----
-            let pf = Date()
-            if sessionFresh, let pBase = prefillBase, let pRes = prefillRes, T <= prefillLen {
-                // Fast path is only valid at session start: adoptState REPLACES
-                // the decode KV, which would erase the acoustic history that
-                // keeps the voice consistent.
-                pBase.resetState(); pRes.resetState()
-                baseDecode.resetState(); resDecode.resetState()
-                let L = prefillLen
-                var emb = [Float](repeating: 0, count: L * H)
-                for t in 0..<T {
-                    glue.embedRow(ids[t]).withUnsafeBufferPointer { src in
-                        emb.withUnsafeMutableBufferPointer { dst in
-                            dst.baseAddress!.advanced(by: t * H).update(from: src.baseAddress!, count: H) } }
-                }
-                let bo = try await pBase.step(["inputs_embeds": .float32(emb, shape: [1, L, H])])
-                let baseAll = try out(bo, "hidden")
-                var resInSeq = [Float](repeating: 0, count: L * H)
-                for t in 0..<L {
-                    let row = Array(baseAll[t * H ..< (t + 1) * H])
-                    let fz = glue.fusion(row, zeros)
-                    fz.withUnsafeBufferPointer { src in
-                        resInSeq.withUnsafeMutableBufferPointer { dst in
-                            dst.baseAddress!.advanced(by: t * H).update(from: src.baseAddress!, count: H) } }
-                }
-                let ro = try await pRes.step(["inputs_embeds": .float32(resInSeq, shape: [1, L, H])])
-                let resAll = try out(ro, "hidden")
-                lmH = Array(baseAll[(T - 1) * H ..< T * H])
-                resH = Array(resAll[(T - 1) * H ..< T * H])
-                baseDecode.adoptState(from: pBase)
-                resDecode.adoptState(from: pRes)
-            } else {
-                // Continuation prefill through the decode bundles so the KV
-                // history (and thus the voice) is preserved. Pipelined: res step
-                // t needs only baseHidden[t], so it runs CONCURRENTLY with base
-                // step t+1; res order is preserved by awaiting t before issuing
-                // t+1. Cuts the prefill wall roughly to the base LM's time alone.
-                var baseHidden: [[Float]] = []; baseHidden.reserveCapacity(T)
-                var resPending: Task<[String: TensorValue], Error>?
-                var resHidden: [Float] = zeros
-                for t in 0..<T {
-                    let o = try await baseDecode.step([
-                        "inputs_embeds": .float32(glue.embedRow(ids[t]), shape: [1, 1, H]),
-                        "pos": .int32([Int32(pos + t)], shape: [1])])
-                    baseHidden.append(try out(o, "hidden"))
-                    if let pendingRes = resPending {
-                        resHidden = try out(try await pendingRes.value, "hidden")
-                    }
-                    let resIn = glue.fusion(baseHidden[t], zeros)
-                    let resPos = Int32(pos + t)
-                    resPending = Task {
-                        try await resDecode.step([
-                            "inputs_embeds": .float32(resIn, shape: [1, 1, H]),
-                            "pos": .int32([resPos], shape: [1])])
-                    }
-                }
-                if let pendingRes = resPending {
-                    resHidden = try out(try await pendingRes.value, "hidden")
-                }
-                lmH = baseHidden[T - 1]; resH = resHidden
-            }
-            sessionFresh = false
-            tick("prefill", pf)
-            pos += T
-
-            // ---- AR diffusion loop for this segment ----
-            for i in 0..<maxFramesPerSegment {
-                if Task.isCancelled { break }
-                let gt = Date()
-                let mu = glue.dit(lm: lmH, res: resH)
-                let z = rng.normals(Self.feat * Self.patch)
-                tick("hostGlue", gt)
-                let ft = Date()
-                let predTV = try await featDecoder.run([
-                    "mu": .float32(mu, shape: [1, H]),
-                    "cond": .float32(cond, shape: [1, Self.feat, Self.patch]),
-                    "z": .float32(z, shape: [1, Self.feat, Self.patch])])
-                let pred = try out(predTV, "pred_feat")
-                tick("featDecoder", ft)
-                pending.append(pred)
-
-                var predFeat = [Float](repeating: 0, count: Self.patch * Self.feat)
-                for c in 0..<Self.feat { for p in 0..<Self.patch { predFeat[p * Self.feat + c] = pred[c * Self.patch + p] } }
-                let et = Date()
-                let currTV = try await featEncoder.run([
-                    "pred_feat": .float32(predFeat, shape: [1, 1, Self.patch, Self.feat])])
-                let curr = try out(currTV, "curr_embed")
-                tick("featEncoder", et)
-                cond = pred
-
-                if pending.count == framesPerChunk { try await flush() }
-
-                // Stop head = THIS segment's text is exhausted, not the end of
-                // speech: continue with the next segment in the same session.
-                if i > minFrames && glue.stop(lmH) == 1 { break }
-
-                let bt = Date()
-                let bo = try await baseDecode.step([
-                    "inputs_embeds": .float32(curr, shape: [1, 1, H]), "pos": .int32([Int32(pos)], shape: [1])])
-                lmH = glue.fsq(try out(bo, "hidden"))
-                tick("baseDecode", bt)
-                let resIn = glue.fusion(lmH, curr)
-                let rt = Date()
-                let ro = try await resDecode.step([
-                    "inputs_embeds": .float32(resIn, shape: [1, 1, H]), "pos": .int32([Int32(pos)], shape: [1])])
-                resH = try out(ro, "hidden")
-                tick("resDecode", rt)
-                pos += 1
-            }
-        }
-        try await flush()
-        if !holdback.isEmpty { let tail = holdback; try await onChunk(currentSegment, tail) }
 
         let total = Date().timeIntervalSince(start)
         return StreamStats(samples: totalSamples,
